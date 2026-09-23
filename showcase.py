@@ -46,6 +46,13 @@ def valid_quote(record: object) -> bool:
     )
 
 
+async def read_bounded(request: web.Request, limit: int) -> bytes:
+    try:
+        return await request.content.readexactly(limit + 1)
+    except asyncio.IncompleteReadError as exc:
+        return exc.partial
+
+
 @dataclass(slots=True)
 class CachedQuote:
     raw: bytes
@@ -73,6 +80,7 @@ class Showcase:
         self.breaker_until = 0.0
         self.failures = 0
         self.refresh_after: OrderedDict[str, float] = OrderedDict()
+        self.retry_after: OrderedDict[str, float] = OrderedDict()
         self.served_local = 0
         self.served_from_catalog = 0
         self.catalog_reads = 0
@@ -148,6 +156,7 @@ class Showcase:
             self.breaker_until = 0.0
             self.failures = 0
             self.refresh_after.clear()
+            self.retry_after.clear()
             self.snapshot_at = 0.0
             for quote_id, entry in list(self.overlay.items()):
                 if not entry.direct:
@@ -168,6 +177,16 @@ class Showcase:
         if len(self.refresh_after) > 8192:
             self.refresh_after.popitem(last=False)
 
+    def _note_busy(self, quote_id: str, seconds: float) -> None:
+        now = time.monotonic()
+        self.retry_after[quote_id] = now + seconds
+        self.retry_after.move_to_end(quote_id)
+        if len(self.retry_after) > 8192:
+            self.retry_after.popitem(last=False)
+        # A short global pause protects a struggling catalog without treating
+        # one busy quote as proof that every other quote is unavailable.
+        self.breaker_until = max(self.breaker_until, now + 0.25)
+
     async def _fetch_from_catalog(self, quote_id: str) -> tuple[int, bytes | None]:
         if self.source is None or self.session is None:
             return 503, None
@@ -175,7 +194,14 @@ class Showcase:
         mutation_version = self.write_versions.get(quote_id, 0)
 
         async with self.catalog_limit:
-            if time.monotonic() < self.breaker_until or source_epoch != self.source_epoch:
+            if source_epoch != self.source_epoch:
+                return 503, None
+            cooldown = self.breaker_until - time.monotonic()
+            if cooldown > 1.0:
+                return 503, None
+            if cooldown > 0:
+                await asyncio.sleep(cooldown)
+            if source_epoch != self.source_epoch:
                 return 503, None
             self.catalog_reads += 1
             try:
@@ -185,12 +211,11 @@ class Showcase:
                             retry = min(3600.0, max(0.0, float(response.headers.get("Retry-After", "1"))))
                         except ValueError:
                             retry = 1.0
-                        self._backoff(retry)
+                        self._note_busy(quote_id, retry)
                         self._note_refresh_failure(quote_id)
                         return 503, None
                     if response.status == 404:
                         self.failures = 0
-                        self.breaker_until = 0.0
                         if mutation_version != self.write_versions.get(quote_id, 0) or source_epoch != self.source_epoch:
                             return 409, None
                         self._remove_overlay(quote_id)
@@ -216,7 +241,6 @@ class Showcase:
                     raw = orjson.dumps(record)
                     self._put_overlay(quote_id, raw, direct=False)
                     self.failures = 0
-                    self.breaker_until = 0.0
                     return 200, raw
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
                 self._backoff()
@@ -228,7 +252,9 @@ class Showcase:
         if task is not None:
             return task
         now = time.monotonic()
-        if self.source is None or now < self.breaker_until or len(self.inflight) >= 24:
+        if self.source is None or self.breaker_until - now > 1.0 or len(self.inflight) >= 96:
+            return None
+        if now < self.retry_after.get(quote_id, 0.0):
             return None
         if background and now < self.refresh_after.get(quote_id, 0.0):
             return None
@@ -369,7 +395,7 @@ async def health(request: web.Request) -> web.Response:
 
 async def set_source(request: web.Request) -> web.Response:
     try:
-        body = await request.content.read(8193)
+        body = await read_bounded(request, 8192)
         if len(body) > 8192:
             raise ValueError("source body is too large")
         document = orjson.loads(body)
@@ -421,8 +447,8 @@ async def import_snapshot(request: web.Request) -> web.Response:
 async def put_quote(request: web.Request) -> web.Response:
     quote_id = request.match_info["quote_id"]
     try:
-        body = await request.content.read(65537)
-        if len(body) > 65536:
+        body = await read_bounded(request, 262144)
+        if len(body) > 262144:
             raise ValueError("too large")
         document = orjson.loads(body)
     except (ValueError, orjson.JSONDecodeError):

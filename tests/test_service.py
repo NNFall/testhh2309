@@ -121,6 +121,7 @@ class FakeCatalog:
         self.quotes = {}
         self.busy = set()
         self.retry_after = "1"
+        self.delays = {}
         self.hits = []
         self.url = None
         self._runner = None
@@ -141,6 +142,8 @@ class FakeCatalog:
     async def _get_quote(self, request):
         quote_id = request.match_info["quote_id"]
         self.hits.append((quote_id, time.monotonic()))
+        if quote_id in self.delays:
+            await asyncio.sleep(self.delays[quote_id])
         if quote_id in self.busy:
             return web.json_response(
                 {"detail": "busy"},
@@ -394,6 +397,64 @@ async def test_catalog_503_respects_retry_after(client):
             await asyncio.sleep(0.5)
         assert (status, body) == (200, catalog.quotes[quote_id])
         assert headers["X-Source"] == "CATALOG"
+
+
+@pytest.mark.asyncio
+async def test_busy_quote_does_not_block_other_ids_or_lose_retry_after(client):
+    busy_id, good_id = _id(), _id()
+    async with FakeCatalog() as catalog:
+        catalog.busy.add(busy_id)
+        catalog.retry_after = "120"
+        catalog.quotes[good_id] = _quote(good_id)
+        catalog.delays[good_id] = 0.1
+        await _source(client, catalog)
+
+        busy = asyncio.create_task(_request(client, "GET", f"/quotes/{busy_id}"))
+        good = asyncio.create_task(_request(client, "GET", f"/quotes/{good_id}"))
+        (busy_status, _, _), (good_status, good_body, _) = await asyncio.gather(busy, good)
+        assert busy_status == 503
+        assert (good_status, good_body) == (200, catalog.quotes[good_id])
+
+        status, _, _ = await _request(client, "GET", f"/quotes/{busy_id}")
+        assert status == 503
+        assert catalog.reads_for(busy_id) == 1
+
+        fresh_id = _id()
+        catalog.quotes[fresh_id] = _quote(fresh_id)
+        status, body, _ = await _request(client, "GET", f"/quotes/{fresh_id}")
+        assert (status, body) == (200, catalog.quotes[fresh_id])
+
+
+@pytest.mark.asyncio
+async def test_concurrent_catalog_reads_do_not_drop_ready_quotes(client):
+    quote_ids = [_id() for _ in range(25)]
+    async with FakeCatalog() as catalog:
+        for quote_id in quote_ids:
+            catalog.quotes[quote_id] = _quote(quote_id)
+            catalog.delays[quote_id] = 0.1
+        await _source(client, catalog)
+        results = await asyncio.gather(*(
+            _request(client, "GET", f"/quotes/{quote_id}") for quote_id in quote_ids
+        ))
+        assert all(status == 200 for status, _, _ in results)
+        assert all(catalog.reads_for(quote_id) == 1 for quote_id in quote_ids)
+
+
+@pytest.mark.asyncio
+async def test_full_length_unicode_put_and_large_snapshot_field(client):
+    put_id, imported_id = _id(), _id()
+    unicode_text = "\U0001f600" * 16384
+    status, body, _ = await _request(
+        client, "PUT", f"/catalog/{put_id}", json={"author": "\u0420\u0435\u0434\u0430\u043a\u0442\u043e\u0440", "text": unicode_text}
+    )
+    assert (status, body["text"]) == (200, unicode_text)
+
+    imported = {**_quote(imported_id), "metadata": "m" * 150000}
+    status, body, _ = await _import(client, [imported])
+    assert (status, body["imported"]) == (200, 1)
+    status, body, headers = await _request(client, "GET", f"/quotes/{imported_id}")
+    assert (status, body) == (200, imported)
+    assert headers["X-Source"] == "LOCAL"
 
 
 @pytest.mark.asyncio

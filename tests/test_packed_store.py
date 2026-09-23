@@ -40,3 +40,19 @@ def test_duplicate_id_rejected_without_changing_count():
 
     assert len(store) == 1
     assert orjson.loads(store.get_raw("same")) == record
+
+
+def test_large_record_and_long_ids_can_be_enumerated():
+    store = PackedStore()
+    records = [
+        {"id": "a" * 70000, "author": "A", "text": "first"},
+        {"id": "large", "author": "A", "text": "second", "metadata": "x" * 150000},
+        {"id": "last", "author": "A", "text": "third"},
+    ]
+    for record in records:
+        store.add(record)
+    store.seal()
+
+    assert list(store.ids()) == [record["id"] for record in records]
+    for record in records:
+        assert orjson.loads(store.get_raw(record["id"])) == record

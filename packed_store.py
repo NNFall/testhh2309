@@ -12,7 +12,7 @@ import zstandard as zstd
 
 BLOCK_SIZE = 128 * 1024
 SLOT = struct.Struct("<QIII")
-ID_LENGTH = struct.Struct("<H")
+RECORD_LENGTH = struct.Struct("<I")
 MAX_LOAD = 0.68
 
 
@@ -28,11 +28,11 @@ class PackedStore:
         "_cache",
         "_compressor",
         "_decompressor",
-        "_id_log",
         "_index",
         "_open_block",
         "_open_size",
         "_payload_bytes",
+        "_record_sizes",
         "_size",
     )
 
@@ -41,11 +41,11 @@ class PackedStore:
         self._cache: OrderedDict[int, bytes] = OrderedDict()
         self._compressor = zstd.ZstdCompressor(level=1)
         self._decompressor = zstd.ZstdDecompressor()
-        self._id_log = bytearray()
         self._index = bytearray(SLOT.size * 1024)
         self._open_block = bytearray(BLOCK_SIZE)
         self._open_size = 0
         self._payload_bytes = 0
+        self._record_sizes = bytearray()
         self._size = 0
 
     def __len__(self) -> int:
@@ -55,7 +55,7 @@ class PackedStore:
     def bytes_used(self) -> int:
         if self._size == 0:
             return 0
-        return self._payload_bytes + len(self._index) + len(self._id_log)
+        return self._payload_bytes + len(self._index) + len(self._record_sizes)
 
     @staticmethod
     def _fingerprint(quote_id: str) -> int:
@@ -90,28 +90,25 @@ class PackedStore:
 
     def add(self, record: dict) -> None:
         quote_id = record["id"]
-        encoded_id = quote_id.encode("utf-8")
-        if len(encoded_id) > 65535:
-            raise ValueError("quote ID is too long")
-
         fingerprint = self._fingerprint(quote_id)
         position, exists = self._find_slot(quote_id, fingerprint)
         if exists:
             raise ValueError("duplicate quote ID")
 
         raw = orjson.dumps(record)
-        if len(raw) > BLOCK_SIZE:
-            raise ValueError("quote is too large")
         if self._open_size + len(raw) > BLOCK_SIZE:
             self._seal_block()
 
         block_no = len(self._blocks)
         offset = self._open_size
-        self._open_block[offset : offset + len(raw)] = raw
-        self._open_size += len(raw)
+        if len(raw) > BLOCK_SIZE:
+            self._blocks.append(self._compressor.compress(raw))
+            self._payload_bytes += len(self._blocks[-1])
+        else:
+            self._open_block[offset : offset + len(raw)] = raw
+            self._open_size += len(raw)
         SLOT.pack_into(self._index, position, fingerprint, block_no, offset, len(raw))
-        self._id_log.extend(ID_LENGTH.pack(len(encoded_id)))
-        self._id_log.extend(encoded_id)
+        self._record_sizes.extend(RECORD_LENGTH.pack(len(raw)))
         self._size += 1
 
         if self._size > (len(self._index) // SLOT.size) * MAX_LOAD:
@@ -156,9 +153,15 @@ class PackedStore:
         return exists
 
     def ids(self) -> Iterator[str]:
-        cursor = 0
-        while cursor < len(self._id_log):
-            size = ID_LENGTH.unpack_from(self._id_log, cursor)[0]
-            cursor += ID_LENGTH.size
-            yield self._id_log[cursor : cursor + size].decode("utf-8")
-            cursor += size
+        if not self._size:
+            return
+        block_no = 0
+        block = self._decompressor.decompress(self._blocks[block_no])
+        offset = 0
+        for (size,) in RECORD_LENGTH.iter_unpack(self._record_sizes):
+            if offset + size > len(block):
+                block_no += 1
+                block = self._decompressor.decompress(self._blocks[block_no])
+                offset = 0
+            yield orjson.loads(block[offset : offset + size])["id"]
+            offset += size
