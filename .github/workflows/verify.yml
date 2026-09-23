@@ -41,8 +41,8 @@ jobs:
           exit 1
       - name: Import two maximum-size snapshots
         run: python benchmarks/stress_import.py --count 340000 --random-bytes 180 --repeats 2
-      - name: Import two snapshots with long random IDs
-        run: python benchmarks/stress_import.py --count 340000 --random-bytes 0 --id-random-bytes 174 --repeats 2
+      - name: Import repeated snapshots with long random IDs
+        run: python benchmarks/stress_import.py --count 340000 --random-bytes 0 --id-random-bytes 174 --repeats 5
       - name: Inspect container limits and memory
         if: always()
         run: |

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import os
 import re
+import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -44,6 +46,16 @@ def valid_quote(record: object) -> bool:
         and isinstance(record.get("author"), str)
         and isinstance(record.get("text"), str)
     )
+
+
+def release_unused_memory() -> None:
+    # The container may receive many full snapshots without restarting. On
+    # glibc, return freed compressed generations and temporary index buffers.
+    if sys.platform.startswith("linux"):
+        try:
+            ctypes.CDLL(None).malloc_trim(0)
+        except (AttributeError, OSError):
+            pass
 
 
 async def read_bounded(request: web.Request, limit: int) -> bytes:
@@ -441,6 +453,8 @@ async def import_snapshot(request: web.Request) -> web.Response:
         state.tombstones = {key: version for key, version in state.tombstones.items() if version > start_version}
         state.invalidated = {key: version for key, version in state.invalidated.items() if version > start_version}
         state.refresh_after.clear()
+        del old_store
+        release_unused_memory()
         return json_reply({"imported": imported, "dropped": dropped})
 
 
